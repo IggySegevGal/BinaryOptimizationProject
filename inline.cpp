@@ -62,6 +62,7 @@ extern "C" {
 #include <fcntl.h>
 #include <values.h>
 #include <vector>
+#include <list>
 #include <map>
 #include <algorithm>
 
@@ -70,32 +71,33 @@ using namespace std;
 using std::cerr;
 using std::endl;
 
-//In this struct every routine's data is saved 
-typedef struct rtn_struct {
-	string routine_name;
-	unsigned int routine_address;
-	string image_name;
-	unsigned int image_address;
-	
-	unsigned long instructions_num;
-	int calls_num ;
-	
-} rtn_st;
-
 typedef struct bbl_struct {
-	string routine_name;
 	ADDRINT routine_address;
 	ADDRINT head_address;
 	ADDRINT tail_address;
 	ADDRINT FT_target;
 	ADDRINT target;
-	
-	
+	ADDRINT next_ins;
 	
 	unsigned long instructions_num; // number of dynamic instructions in the bbl 
 	unsigned long taken_count;
 	unsigned long not_taken_count;
+	
+	//for probe mode
+	bool was_reordered;
 } bbl_st;
+
+//In this struct every routine's data is saved 
+typedef struct rtn_struct {
+	unsigned int routine_address;
+
+	unsigned long instructions_num;
+	int calls_num ;
+	
+	map<ADDRINT,bbl_st> rtn_bbls_map;
+} rtn_st;
+
+
 
 
 /*======================================================================*/
@@ -186,6 +188,102 @@ int translated_rtn_num = 0;
 /* Service dump routines                                         */
 /* ============================================================= */
 
+
+/* ===================COMPARE FUNCTIONS================================================== */
+
+// a compare function to sort the map by ins_count
+bool compare_rtn (const pair<unsigned int, rtn_st*>& a , const pair<unsigned int, rtn_st*>& b)
+{
+	return a.second->instructions_num > b.second->instructions_num;
+}
+
+bool compare_bbl (const pair<unsigned int, bbl_st*>& a , const pair<unsigned int, bbl_st*>& b)
+{
+	return a.second->instructions_num > b.second->instructions_num;
+}
+
+bool compare_bbl_by_tail (const pair<unsigned int, bbl_st*>& a , const pair<unsigned int, bbl_st*>& b)
+{
+	return a.second->tail_address > b.second->tail_address;
+}
+
+
+/* ===================================================================== */
+
+/* ===================================================================== */
+/* =====================READ AND WRITE BINARY FILES======================================= */
+
+/* ===================================================================== */
+void writeBinary(const std::string& filePath) {
+    std::ofstream outFile(filePath, std::ios::binary);
+
+    // Write the number of routines
+    size_t numRoutines = rtn_map.size();
+    outFile.write(reinterpret_cast<char*>(&numRoutines), sizeof(numRoutines));
+
+    for (auto it = rtn_map.begin(); it != rtn_map.end(); ++it) {
+        // Write routine data
+        outFile.write(reinterpret_cast<const char*>(&it->second->routine_address), sizeof(it->second->routine_address));
+        outFile.write(reinterpret_cast<const char*>(&it->second->instructions_num), sizeof(it->second->instructions_num));
+        outFile.write(reinterpret_cast<const char*>(&it->second->calls_num), sizeof(it->second->calls_num));
+
+        // Write number of BBLs in this routine
+        size_t numBBLs = it->second->rtn_bbls_map.size();
+        outFile.write(reinterpret_cast<const char*>(&numBBLs), sizeof(numBBLs));
+
+		for (auto bblIt = it->second->rtn_bbls_map.begin(); bblIt != it->second->rtn_bbls_map.end(); ++bblIt) {
+            // Write BBL address (key)
+            ADDRINT bblAddr = bblIt->first;
+            outFile.write(reinterpret_cast<const char*>(&bblAddr), sizeof(bblAddr));
+            
+            // Write BBL data
+            bbl_st bblData = bblIt->second;
+            outFile.write(reinterpret_cast<const char*>(&bblData), sizeof(bblData));
+        }
+    }
+
+    outFile.close();
+}
+
+void readBinary(const std::string& filePath) {
+    std::ifstream inFile(filePath, std::ios::binary);
+
+    // Read the number of routines
+    size_t numRoutines;
+    inFile.read(reinterpret_cast<char*>(&numRoutines), sizeof(numRoutines));
+
+    for (size_t i = 0; i < numRoutines; ++i) {
+        rtn_st* routineData = new(rtn_st);
+
+        // Read routine data
+        inFile.read(reinterpret_cast<char*>(&routineData->routine_address), sizeof(routineData->routine_address));
+        inFile.read(reinterpret_cast<char*>(&routineData->instructions_num), sizeof(routineData->instructions_num));
+        inFile.read(reinterpret_cast<char*>(&routineData->calls_num), sizeof(routineData->calls_num));
+
+        // Read number of BBLs in this routine
+        size_t numBBLs;
+        inFile.read(reinterpret_cast<char*>(&numBBLs), sizeof(numBBLs));
+
+        for (size_t j = 0; j < numBBLs; ++j) {
+            ADDRINT bblAddr;
+            bbl_st bblData;
+
+            // Read BBL address (key)
+            inFile.read(reinterpret_cast<char*>(&bblAddr), sizeof(bblAddr));
+            
+            // Read BBL data
+            inFile.read(reinterpret_cast<char*>(&bblData), sizeof(bblData));
+
+            // Add BBL data to map
+            routineData->rtn_bbls_map[bblAddr] = bblData;
+        }
+
+        // Add routine data to map
+        rtn_map[routineData->routine_address] = routineData;
+    }
+
+    inFile.close();
+}
 /*************************/
 /* dump_all_image_instrs */
 /*************************/
@@ -808,34 +906,104 @@ int find_candidate_rtns_for_translation(IMG img)
 
             // Open the RTN.
             RTN_Open( rtn ); 
-            
-            for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
-                
-                ADDRINT addr = INS_Address(ins);
-                
-                //debug print of orig instruction:
-                if (KnobVerbose) {
-                    cerr << "old instr: ";
-                    cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) <<  endl;
-                    //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));                               
-                }        
-                
-                xed_decoded_inst_t xedd;
-                xed_error_enum_t xed_code;                            
-                
-                xed_decoded_inst_zero_set_mode(&xedd,&dstate); 
+			//eyal
+			// fill a local map for the current rtn. later it will be reordered and inserted into the instruction map
+				map<ADDRINT, xed_decoded_inst_t> rtn_local_instrs_map;
+				rtn_local_instrs_map.clear();
+				for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
+					
+					ADDRINT addr = INS_Address(ins);
+					
+					//debug print of orig instruction:
+					if (KnobVerbose) {
+						cerr << "old instr: ";
+						cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) <<  endl;
+						//xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));                               
+					}        
+					
+					xed_decoded_inst_t xedd;
+					xed_error_enum_t xed_code;                            
+					
+					xed_decoded_inst_zero_set_mode(&xedd,&dstate); 
 
-                xed_code = xed_decode(&xedd, reinterpret_cast<UINT8*>(addr), max_inst_len);
-                if (xed_code != XED_ERROR_NONE) {
-                    cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
-                    translated_rtn[translated_rtn_num].instr_map_entry = -1;
-                    break;
-                }
-                
-                // Save xed and addr into a map to be used later.
-                local_instrs_map[addr] = xedd;
-                
-            } // end for INS...
+					xed_code = xed_decode(&xedd, reinterpret_cast<UINT8*>(addr), max_inst_len);
+					if (xed_code != XED_ERROR_NONE) {
+						cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
+						translated_rtn[translated_rtn_num].instr_map_entry = -1;
+						break;
+					}
+					
+					// Save xed and addr into a map to be used later.
+					rtn_local_instrs_map[addr] = xedd;
+					
+				} // end for INS...
+				
+				//--------------REORDERING-----------------------------------------------------------------------------------
+				/*
+				INS first_ins = RTN_InsHead(rtn);			
+				bbl_st curr_bbl=tmp_rtn_bbls_map[first_ins];
+				ADDRINT head_address=curr_bbl.head_address;
+				ADDRINT tail_address=curr_bbl.tail_address;
+				while(!tmp_rtn_bbls_map.empty()){
+					    for(const auto& pair : rtn_local_instrs_map) {
+							destinationMap.insert(pair);
+    }
+				}
+				*/
+			/*
+            if(RTN_Name=="myMalloc"){
+				INS first_ins = RTN_InsHead(rtn);
+				
+				map<ADDRINT,bbl_st> tmp_rtn_bbls_map = *(rtn_map[RTN_Address(rtn)]->rtn_bbls_map);
+				bbl_st curr_bbl=tmp_rtn_bbls_map[first_ins];
+				ADDRINT head_address=curr_bbl.head_address;
+				ADDRINT tail_address=curr_bbl.tail_address;
+				//iterate over all bbls and insert them to the map
+				while(!tmp_rtn_bbls_map.empty()){
+					// insert all of the bbl's instructions (besides the tail that might change)
+					for (INS ins = head_address; INS_Address(ins)<tail_address; ins = INS_Next(ins)) { 
+						ADDRINT addr = INS_Address(ins);
+						
+						//debug print of orig instruction:
+						if (KnobVerbose) {
+							cerr << "old instr: ";
+							cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) <<  endl;
+							//xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));                               
+						}        
+						
+						xed_decoded_inst_t xedd;
+						xed_error_enum_t xed_code;                            
+						
+						xed_decoded_inst_zero_set_mode(&xedd,&dstate); 
+
+						xed_code = xed_decode(&xedd, reinterpret_cast<UINT8*>(addr), max_inst_len);
+						if (xed_code != XED_ERROR_NONE) {
+							cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
+							translated_rtn[translated_rtn_num].instr_map_entry = -1;
+							break;
+						}
+						
+						// Save xed and addr into a map to be used later.
+						local_instrs_map[addr] = xedd;
+					}
+					//INSERT THE CORRECT TAIL (depends on the bbl's head of taken/fallthrough)
+					if(curr_bbl.taken_count > curr_bbl.not_taken_count){
+						//insert inverted jump
+					}
+					else{
+						//insert regular jump
+						
+					}
+					
+					
+				}
+			}
+			*/
+		// test for no reordering	
+    for(const auto& pair : rtn_local_instrs_map) {
+        local_instrs_map.insert(pair);
+    }
+
 
 
             // debug print of routine name:
@@ -919,7 +1087,7 @@ int find_candidate_rtns_for_translation(IMG img)
 							break;
 						} 
 					}
-				  //eyal
+				  
 				} else{
 				int rc = add_new_instr_entry(&inline_xedd, addr, xed_decoded_inst_get_length(&inline_xedd),inline_counter);//ADD THE INST TO THE GLOBAL MAP
 				if (rc < 0) {
@@ -1161,6 +1329,8 @@ VOID ImageLoad(IMG img, VOID *v)
 	  commit_translated_routines();	
 	  cout << "after commit translated routines" << endl;
     }
+	////////////////////////////////////////////////////////////////////////////////////////
+	//print testing stuff here
 }
 
 
@@ -1194,10 +1364,6 @@ VOID ROUTINE(RTN my_rtn, VOID* v) {
 	//give each routine struct the names and address of the routine and of the image
 	ADDRINT my_addr=RTN_Address(my_rtn); // this is the current rtn's address
 	IMG  img = IMG_FindByAddress(my_addr);// the image of the rtn can be found from the rtn's address
-	rtn->image_name = IMG_Name(img);//image's name
-	rtn->image_address = IMG_LowAddress(img);//image's address
-
-	rtn->routine_name = RTN_Name(my_rtn);//rtn's name
 	rtn->routine_address = my_addr;//rtn's address
 	
 	rtn->instructions_num = 0;
@@ -1238,7 +1404,7 @@ VOID TRACE_INSTRUMENTATION(TRACE trace, VOID *v) {
 		}
 			bbl_st* my_bbl = new bbl_st;
 			my_bbl->routine_address=RTN_Address(rtn);
-			my_bbl->routine_name = RTN_Name(rtn);
+			//my_bbl->routine_name = RTN_Name(rtn);
 			
 			INS head=BBL_InsHead(bbl);
 			my_bbl->head_address=INS_Address(head);
@@ -1254,6 +1420,11 @@ VOID TRACE_INSTRUMENTATION(TRACE trace, VOID *v) {
 			else{
 				my_bbl->FT_target=0;
 			}
+			
+			my_bbl->next_ins = INS_NextAddress(tail);
+			my_bbl->was_reordered=false;
+
+			
 			
 			//find jump target
 			if(INS_IsDirectControlFlow(tail)){
@@ -1280,23 +1451,47 @@ VOID TRACE_INSTRUMENTATION(TRACE trace, VOID *v) {
 }
 
 
+
 /* ===================================================================== */
-
-// a compare function to sort the map by ins_count
-bool compare_rtn (const pair<unsigned int, rtn_st*>& a , const pair<unsigned int, rtn_st*>& b)
-{
-	return a.second->instructions_num > b.second->instructions_num;
-}
-
-bool compare_bbl (const pair<unsigned int, bbl_st*>& a , const pair<unsigned int, bbl_st*>& b)
-{
-	return a.second->instructions_num > b.second->instructions_num;
-}
 
 /* ===================================================================== */
 
 VOID Fini(INT32 code, VOID* v) { 
-	/////////////////////PRINT ROUTINE MAP//////////////////////////////////////////
+	
+	
+	vector<pair<unsigned int, bbl_st*>> bbl_vec(bbl_map.begin(), bbl_map.end());
+// insert the bbl's to their routines 
+	for (const pair<const unsigned int, bbl_st*>& pair : bbl_vec) {
+		const bbl_st& current_bbl = *(pair.second);
+		ADDRINT current_rtn_addr = current_bbl.routine_address;		
+		if(rtn_map.find(current_rtn_addr)==rtn_map.end()){continue;}//check if routine has been translated
+			//insert all the bbls to theire respective rtns. in case of 2 bbls with the same tail, take the one the contains the other (smalles head address)
+			if(rtn_map[current_rtn_addr]->rtn_bbls_map.find(current_bbl.tail_address)==rtn_map[current_rtn_addr]->rtn_bbls_map.end()){
+				rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address]=current_bbl;
+			}
+			else{
+				if(rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address].head_address > current_bbl.head_address){
+					rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address]=current_bbl;
+				}
+			}
+			
+			
+	}
+
+	// change the bbl map to keys with head address instead of tail address:
+	
+	for(auto& pair : rtn_map){
+		map<ADDRINT, bbl_st> bbl_map_key_is_head;
+		for(const auto& pair2:pair.second->rtn_bbls_map){
+			const bbl_st& bbl=pair2.second;
+			bbl_map_key_is_head[bbl.head_address]=bbl;
+		}
+		pair.second->rtn_bbls_map=std::move(bbl_map_key_is_head);
+	}
+	
+	
+		/////////////////////PRINT ROUTINE MAP//////////////////////////////////////////
+
 	// sort the map by ins_count
 	// create a vector from the pairs of the map
 	vector<pair<unsigned int, rtn_st*>> sorted_vec(rtn_map.begin(), rtn_map.end());
@@ -1311,43 +1506,43 @@ VOID Fini(INT32 code, VOID* v) {
 			output
 			
 			<< std::hex	
-			<< "0x"
-			<<data.routine_address
-			<<" , "	
-			<< data.routine_name 	
-			<< " , " 
-			<<data.image_name 
-			<< " , " 
+			<< "0x" 			   <<data.routine_address <<" , "	
+			//<< data.routine_name   << " , " 
+			//<<data.image_name      << " , " 
 			<< std::hex
-			<< "0x"
-			<< data.image_address	
-		 	<< " , "			
+			//<< "0x"				   << data.image_address  << " , "			
 			<< std::dec		
-			<<data.instructions_num
-			<< " , " 	
+			<<data.instructions_num<< " , " 	
 			<< data.calls_num
-			<<endl;
+			<<std::hex;
+// print all the tails of the bbls in the routine:
+			for (const auto& pair2 : data.rtn_bbls_map) {
+				ADDRINT head_addr=pair2.first;
+				output << " , " << "0x" << head_addr << " ";
+			}
+			output<<endl;
 		}
-		delete pair.second;
 	}
 	output.close();
 ///////////////////////////PRINT BBL MAP//////////////////////////////////////////
-	vector<pair<unsigned int, bbl_st*>> sorted_bbl_vec(bbl_map.begin(), bbl_map.end());
-	sort(sorted_bbl_vec.begin(), sorted_bbl_vec.end(), compare_bbl);
+
+	
+	sort(bbl_vec.begin(), bbl_vec.end(), compare_bbl);
 	
 	ofstream output2("bbl_prof.csv");
 	
-	output2 << "rtn_name , rtn_addr , head_addr , tail_addr , FT , target , ins_count , taken_count , not_taken_count " << endl;
-	for (const pair<const unsigned int, bbl_st*>& pair : sorted_bbl_vec) {
+	output2 << "rtn_name , rtn_addr , head_addr , tail_addr , FT , next_ins , target , ins_count , taken_count , not_taken_count " << endl;
+	for (const pair<const unsigned int, bbl_st*>& pair : bbl_vec) {
 		const bbl_st& data = *(pair.second); 
 
 			output2
-			<< data.routine_name << " , "
+			//<< data.routine_name << " , "
 			<< std::hex	
 			<< "0x"<<data.routine_address<<" , "	
 			<< "0x"<<data.head_address	 <<" , "
 			<< "0x"<<data.tail_address	 <<" , " 
 			<< "0x"<<data.FT_target		 <<" , " 
+			<< "0x"<<data.next_ins		 <<" , " 
 			<< "0x"<<data.target		 <<" , " 
 			<< std::dec 
 			<<data.instructions_num 	 <<" , "
@@ -1358,6 +1553,9 @@ VOID Fini(INT32 code, VOID* v) {
 		delete pair.second;
 	}
 	output2.close();
+///////////////////////////// WRITE BINARY/////////////////////////////////////////////////////
+    std::string filePath = "counts.bin";
+	writeBinary(filePath);
 
 }
 /* ===================================================================== */
@@ -1376,21 +1574,7 @@ int main(int argc, char * argv[])
     PIN_InitSymbols();
     if(KnobInst){
 	//read the csv here 
-	//V1: this version works but it is slow: 
-	/* 
-	ifstream infile("loop-count.csv");
-	string line;
-	string field;
-	for(int i =0; i<10;i++){
-		getline(infile, line);
-		istringstream s(line);//create a string stream of each line
-		if(getline(s,field,',')){//take the first field of each line
- 		//cout << stoul(field,nullptr,16) <<endl;
-		ADDRINT addr=std::stoull(field,nullptr,16);
-		hot_rtn_addr.push_back(addr);
-		}
-	}
-*/
+/*
 	//V2
 	FILE* file =fopen("loop-count.csv" ,"r");
 	if(file){
@@ -1410,6 +1594,7 @@ int main(int argc, char * argv[])
 	//}
 	//
 	 //Register ImageLoad
+	 */
 	IMG_AddInstrumentFunction(ImageLoad, 0);
 	PIN_StartProgramProbed();
     }
