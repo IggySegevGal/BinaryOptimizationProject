@@ -65,6 +65,7 @@ extern "C" {
 #include <list>
 #include <map>
 #include <algorithm>
+#include <unordered_set>
 
 
 using namespace std;
@@ -92,9 +93,11 @@ typedef struct rtn_struct {
 	unsigned int routine_address;
 
 	unsigned long instructions_num;
-	int calls_num ;
+	unsigned long calls_num ;
 	
 	map<ADDRINT,bbl_st> rtn_bbls_map;
+	map <ADDRINT, unsigned long> calls_map;
+
 } rtn_st;
 
 
@@ -115,8 +118,8 @@ KNOB<BOOL>   KnobDoNotCommitTranslatedCode(KNOB_MODE_WRITEONCE,    "pintool",
 KNOB<BOOL>   KnobProf(KNOB_MODE_WRITEONCE,    "pintool",
     "prof", "0", "run profiler");
 
-KNOB<BOOL>   KnobInst(KNOB_MODE_WRITEONCE,    "pintool",
-    "inst", "0", "run inst");
+KNOB<BOOL>   KnobOpt(KNOB_MODE_WRITEONCE,    "pintool",
+    "opt", "0", "run inst");
 
 /* ===================================================================== */
 /* Global Variables */
@@ -125,8 +128,8 @@ std::ofstream* out = 0;
 
 map <ADDRINT,rtn_st*> rtn_map;
 map <ADDRINT,bbl_st*> bbl_map;
-vector<ADDRINT> hot_rtn_addr;
-int rtn_num = 0;
+vector<pair<ADDRINT,ADDRINT>> call_vector;
+unordered_set<ADDRINT> hot_calls_set;
 
 
 // For XED:
@@ -149,6 +152,7 @@ ADDRINT highest_sec_addr = 0;
 // tc containing the new code:
 char *tc;	
 int tc_cursor = 0;
+int tmp_tc_cursor = 0;
 int inline_counter = 0;
 
 // instruction map with an entry for each new instruction:
@@ -164,9 +168,15 @@ typedef struct {
 	int inline_index; //OUR ADDITION
 } instr_map_t;
 
+typedef struct { 
+	ADDRINT orig_ins_addr;
+	ADDRINT orig_targ_addr;
+} tmp_instr_map_t;
 
 instr_map_t *instr_map = NULL;
+tmp_instr_map_t *tmp_instr_map = NULL;
 int num_of_instr_map_entries = 0;
+int num_of_instr_map_entries_tmp = 0;
 int max_ins_count = 0;
 
 
@@ -191,13 +201,19 @@ int translated_rtn_num = 0;
 /* ============================================================= */
 
 
-/* ===================COMPARE FUNCTIONS================================================== */
+/* ===================  FUNCTIONS================================================== */
 
 // a compare function to sort the map by ins_count
-bool compare_rtn (const pair<unsigned int, rtn_st*>& a , const pair<unsigned int, rtn_st*>& b)
+bool compare_rtn_by_inst (const pair<unsigned int, rtn_st*>& a , const pair<unsigned int, rtn_st*>& b)
 {
 	return a.second->instructions_num > b.second->instructions_num;
 }
+
+bool compare_rtn_by_calls (const pair<unsigned int, rtn_st*>& a , const pair<unsigned int, rtn_st*>& b)
+{
+	return a.second->calls_num > b.second->calls_num;
+}
+
 
 bool compare_bbl (const pair<unsigned int, bbl_st*>& a , const pair<unsigned int, bbl_st*>& b)
 {
@@ -233,7 +249,7 @@ void writeBinary(const std::string& filePath) {
         size_t numBBLs = it->second->rtn_bbls_map.size();
         outFile.write(reinterpret_cast<const char*>(&numBBLs), sizeof(numBBLs));
 
-		for (auto bblIt = it->second->rtn_bbls_map.begin(); bblIt != it->second->rtn_bbls_map.end(); ++bblIt) {
+        for (auto bblIt = it->second->rtn_bbls_map.begin(); bblIt != it->second->rtn_bbls_map.end(); ++bblIt) {
             // Write BBL address (key)
             ADDRINT bblAddr = bblIt->first;
             outFile.write(reinterpret_cast<const char*>(&bblAddr), sizeof(bblAddr));
@@ -242,13 +258,34 @@ void writeBinary(const std::string& filePath) {
             bbl_st bblData = bblIt->second;
             outFile.write(reinterpret_cast<const char*>(&bblData), sizeof(bblData));
         }
+
+        // Write number of calls in calls_map
+        size_t numCalls = it->second->calls_map.size();
+        outFile.write(reinterpret_cast<const char*>(&numCalls), sizeof(numCalls));
+
+        // Write calls_map data
+        for(auto callsIt = it->second->calls_map.begin(); callsIt != it->second->calls_map.end(); ++callsIt) {
+            ADDRINT callAddr = callsIt->first;
+            unsigned long callCount = callsIt->second;
+            outFile.write(reinterpret_cast<const char*>(&callAddr), sizeof(callAddr));
+            outFile.write(reinterpret_cast<const char*>(&callCount), sizeof(callCount));
+        }
     }
+	
+	// Write the number of elements in hot_calls_set
+	size_t numHotCalls = hot_calls_set.size();
+	outFile.write(reinterpret_cast<const char*>(&numHotCalls), sizeof(numHotCalls));
+
+	// Write hot_calls_set data
+	for(const auto& callAddr : hot_calls_set) {
+		outFile.write(reinterpret_cast<const char*>(&callAddr), sizeof(callAddr));
+	}
 
     outFile.close();
 }
 
 void readBinary(const std::string& filePath) {
-    std::ifstream inFile(filePath, std::ios::binary);
+     std::ifstream inFile(filePath, std::ios::binary);
 
     // Read the number of routines
     size_t numRoutines;
@@ -280,9 +317,37 @@ void readBinary(const std::string& filePath) {
             routineData->rtn_bbls_map[bblAddr] = bblData;
         }
 
+        // Read number of calls in calls_map
+        size_t numCalls;
+        inFile.read(reinterpret_cast<char*>(&numCalls), sizeof(numCalls));
+
+        // Read calls_map data
+        for(size_t k = 0; k < numCalls; ++k) {
+            ADDRINT callAddr;
+            unsigned long callCount;
+            inFile.read(reinterpret_cast<char*>(&callAddr), sizeof(callAddr));
+            inFile.read(reinterpret_cast<char*>(&callCount), sizeof(callCount));
+
+            // Add data to calls_map
+            routineData->calls_map[callAddr] = callCount;
+        }
+
         // Add routine data to map
         rtn_map[routineData->routine_address] = routineData;
     }
+	
+	// Read number of elements in hot_calls_set
+	size_t numHotCalls;
+	inFile.read(reinterpret_cast<char*>(&numHotCalls), sizeof(numHotCalls));
+
+	// Read hot_calls_set data
+	for(size_t i = 0; i < numHotCalls; ++i) {
+		ADDRINT callAddr;
+		inFile.read(reinterpret_cast<char*>(&callAddr), sizeof(callAddr));
+
+		// Add data to hot_calls_set
+		hot_calls_set.insert(callAddr);
+	}
 
     inFile.close();
 }
@@ -410,6 +475,46 @@ void invert_jmp(xed_decoded_inst_t* xedd){
 
 	
 }
+
+/*************************/
+/* add final jmp after reorder */
+/*************************/
+void add_final_jmp(xed_decoded_inst_t* xedd){
+	
+	unsigned int max_size = XED_MAX_INSTRUCTION_BYTES;
+	unsigned int new_size = 0;
+	xed_uint8_t enc_buf2[XED_MAX_INSTRUCTION_BYTES];		
+		xed_int32_t disp = xed_decoded_inst_get_branch_displacement(xedd);
+		xed_encoder_instruction_t  enc_instr;
+
+		xed_inst1(&enc_instr, dstate, 
+				XED_ICLASS_JMP, 64,
+				xed_relbr(disp, 32));
+                                
+		xed_encoder_request_t enc_req;
+
+		xed_encoder_request_zero_set_mode(&enc_req, &dstate);
+		xed_bool_t convert_ok = xed_convert_to_encoder_request(&enc_req, &enc_instr);
+		if (!convert_ok) {
+			cerr << "conversion to encode request failed" << endl;
+			return;
+		}
+
+		xed_error_enum_t xed_error = xed_encode (&enc_req, enc_buf2, max_size, &new_size);
+		if (xed_error != XED_ERROR_NONE) {
+			cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;				
+			return;
+		}
+
+		xed_decoded_inst_zero_set_mode(xedd,&dstate);
+		xed_error_enum_t xed_code = xed_decode(xedd, enc_buf2, XED_MAX_INSTRUCTION_BYTES);
+		if (xed_code != XED_ERROR_NONE) {
+			cerr << "ERROR: new final jmp decode failed" << endl;
+			return;
+		}
+		
+}
+
 
 /*************************/
 /* dump_all_image_instrs */
@@ -627,8 +732,45 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size 
 
 	return new_size;
 }
+/*************************************************/
+/* add_new_instr_entry() TO TMP MAP (TO BE USED BETWEEN REORDER AND INLINE PHASES) */
+/*************************************************/
+void add_new_instr_entry_to_tmp_map(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size , int inline_counter , ADDRINT orig_targ_addr)
+{
 
+	// copy orig instr to instr map:
+	if (xed_decoded_inst_get_length (xedd) != size) {
+		cerr << "Invalid instruction decoding in tmp map " << endl;
+	}
+	
 
+	if(orig_targ_addr==0){
+		xed_uint_t disp_byts = xed_decoded_inst_get_branch_displacement_width(xedd);
+		xed_int32_t disp;
+		if (disp_byts > 0) { // there is a branch offset.
+			disp = xed_decoded_inst_get_branch_displacement(xedd);
+			orig_targ_addr = pc + xed_decoded_inst_get_length (xedd) + disp;	
+		}
+	}
+
+	// add a new entry in the instr_map:
+	
+	instr_map[num_of_instr_map_entries_tmp].orig_ins_addr = pc;
+	instr_map[num_of_instr_map_entries_tmp].orig_targ_addr = orig_targ_addr; 
+
+	num_of_instr_map_entries++;
+
+	if (num_of_instr_map_entries_tmp >= max_ins_count) {
+		cerr << "out of memory for map_instr IN TMP MAP" << endl;
+	}
+	
+
+    // debug print new encoded instr:
+	if (KnobVerbose) {
+		cerr << "    new instr in tmp map :";
+		dump_instr_from_mem((ADDRINT *)instr_map[num_of_instr_map_entries_tmp-1].encoded_ins, instr_map[num_of_instr_map_entries_tmp-1].new_ins_addr);
+	}
+}
 /*************************************************/
 /* chain_all_direct_br_and_call_target_entries() */
 /*************************************************/
@@ -755,9 +897,31 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
 	if (category_enum != XED_CATEGORY_CALL && category_enum != XED_CATEGORY_UNCOND_BR) {
 
 		cerr << "ERROR: Invalid direct jump from translated code to original code in rotuine: " 
-			  << RTN_Name(RTN_FindByAddress(instr_map[instr_map_entry].orig_ins_addr)) << endl;
+			  << RTN_Name(RTN_FindByAddress(instr_map[instr_map_entry].orig_ins_addr)) 
+			  << " original address: "<<instr_map[instr_map_entry].orig_ins_addr
+			  << " original target address: "<<instr_map[instr_map_entry].orig_targ_addr
+			  <<endl;
+		cerr<< "the instruction map is: " << endl;
+		for(int i = 0; i<num_of_instr_map_entries;i++){
+			cerr << " entry_num: " << i 
+				 <<	" orig_ins_addr: " << instr_map[i].orig_ins_addr 
+				 << " new_ins_addr: "  << instr_map[i].new_ins_addr
+				 << " hasNewTargAddr: "<< instr_map[i].hasNewTargAddr
+				 << " orig_targ_addr: "<< instr_map[i].orig_targ_addr
+				 <<endl;
+		}
 		dump_instr_map_entry(instr_map_entry);
 		return -1;
+		/*
+			instr_map[num_of_instr_map_entries].orig_ins_addr = pc;
+	instr_map[num_of_instr_map_entries].new_ins_addr = (ADDRINT)&tc[tc_cursor];  // set an initial estimated addr in tc
+	instr_map[num_of_instr_map_entries].orig_targ_addr = orig_targ_addr; 
+    instr_map[num_of_instr_map_entries].hasNewTargAddr = false;
+	instr_map[num_of_instr_map_entries].targ_map_entry = -1;
+	instr_map[num_of_instr_map_entries].size = new_size;	
+    instr_map[num_of_instr_map_entries].category_enum = xed_decoded_inst_get_category(xedd);
+	instr_map[num_of_instr_map_entries].inline_index = inline_counter;//OUR ADDITION
+		*/
 	}
 
 	// check for cases of direct jumps/calls back to the orginal target address:
@@ -1011,7 +1175,6 @@ int find_candidate_rtns_for_translation(IMG img)
     local_instrs_map.clear();
 	map<ADDRINT, xed_decoded_inst_t> rtn_local_instrs_map;
     // go over routines and check if they are candidates for translation and mark them for translation:
-cerr << "before for" << endl;
     for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec))
     {   
         if (!SEC_IsExecutable(sec) || SEC_IsWriteable(sec) || !SEC_Address(sec))
@@ -1027,11 +1190,22 @@ cerr << "before for" << endl;
 				cerr << "Warning: skipping routine " <<std::hex << RTN_Address(rtn) << endl;
 				continue;
 			}
-			if(RTN_Name(rtn)!= "hasSuffix"){
+			if(rtn_map[RTN_Address(rtn)]->rtn_bbls_map.empty()==true){
 				continue;
 			}
-            translated_rtn[translated_rtn_num].rtn_addr = RTN_Address(rtn);            
-            translated_rtn[translated_rtn_num].rtn_size = RTN_Size(rtn);
+			//if(((RTN_Name(rtn)!="mmed3")) ){ //RTN_Name(rtn)!= "hasSuffix" && 
+			//	continue;
+			//}
+		// PRINT RTN's NAME
+		//		cout << "RTN_NAME: " << RTN_Name(rtn)<<endl;
+			//	cout << "Address: " << std::hex<<RTN_Address(rtn)<<endl;
+				//cout << "address from map: " << rtn_map[RTN_Address(rtn)]->routine_address << endl;
+				//cout << "ins_num from map: " << rtn_map[RTN_Address(rtn)]->instructions_num << endl;
+
+            translated_rtn[translated_rtn_num].rtn_addr = RTN_Address(rtn);			
+			translated_rtn[translated_rtn_num].rtn_size = RTN_Size(rtn);
+			translated_rtn[translated_rtn_num].instr_map_entry = num_of_instr_map_entries;
+			translated_rtn[translated_rtn_num].isSafeForReplacedProbe = true;	
 
             // Open the RTN.
             RTN_Open( rtn ); 
@@ -1063,6 +1237,14 @@ cerr << "before for" << endl;
 					rtn_local_instrs_map[addr] = xedd;
 					
 				} // end for INS...
+				map<ADDRINT, xed_decoded_inst_t> test_map=rtn_local_instrs_map;
+				/*
+				//PRINT THE ROUTINE MAP ADDRESSES	
+				cerr << "THESE ARE THE ADDRESSES IN THE LOCAL RTN_MAP FOR RTN:  " << RTN_Name(rtn)<< endl;
+				for(const auto& pair : rtn_local_instrs_map) {
+					cerr << std::hex<<pair.first << endl;
+				}
+					*/
 				
 				//--------------REORDERING-----------------------------------------------------------------------------------
 								
@@ -1073,6 +1255,7 @@ cerr << "before for" << endl;
 				bbl_st next_bbl;
 				ADDRINT head_address=curr_bbl.head_address;
 				ADDRINT tail_address=curr_bbl.tail_address;
+				bool  changed_FT=false;
 				while(!tmp_rtn_bbls_map.empty()){
 					ADDRINT original_target_of_tail=0;
 					auto start_it=rtn_local_instrs_map.find(head_address);
@@ -1082,12 +1265,6 @@ cerr << "before for" << endl;
 						ADDRINT addr = it->first;
 						xed_decoded_inst_t xedd = it->second;           
 
-					   // Check if we are at a routine header:
-					   if (translated_rtn[rtn_num].rtn_addr == addr) {
-						   translated_rtn[rtn_num].instr_map_entry = num_of_instr_map_entries;
-						   translated_rtn[rtn_num].isSafeForReplacedProbe = true;
-						   rtn_num++;
-					   }
 					          //debug print of orig instruction:
 					   if (KnobVerbose) {
 						 char disasm_buf[2048];
@@ -1096,9 +1273,10 @@ cerr << "before for" << endl;
 					   }
 					   //insert 
 					   	int rc = add_new_instr_entry(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,0);
+						test_map.erase(addr);
 						if (rc < 0) {
 							cerr << "ERROR: failed during instructon translation." << endl;
-							translated_rtn[rtn_num].instr_map_entry = -1;
+							translated_rtn[translated_rtn_num].instr_map_entry = -1;
 							break;
 						}
 					}
@@ -1110,13 +1288,13 @@ cerr << "before for" << endl;
 					
 					//add either the original or an inverted tail depending of taken/not_taken profile
 					if(curr_bbl.FT_target!=0 && curr_bbl.target!=0){//this is a branch and we need to choose the next bbl depending on taken/not taken frequency
-						if(curr_bbl.taken_count<curr_bbl.not_taken_count){
-							//insert the regular jump
+						if(curr_bbl.taken_count<curr_bbl.not_taken_count){		//insert the regular jump
 							if(tmp_rtn_bbls_map.find(curr_bbl.next_ins)!=tmp_rtn_bbls_map.end()){//check if the new FT target was already added
 								next_bbl=tmp_rtn_bbls_map[curr_bbl.next_ins];// declare next bbl to be the original FT
 							}
 							else{ // if the wanted FT was already inserted, just take another unrelated bbl from the map.
 								next_bbl=tmp_rtn_bbls_map.begin()->second;
+								changed_FT=true;
 								//FUTURE OPTIMIZATION: TRY TO USE THE JUMP TARGET BBL AS THE NEXT BBL 
 							}
 							
@@ -1124,18 +1302,18 @@ cerr << "before for" << endl;
 						else{ //REORDER
 						
 							//insert an INVERTED jump 
-							invert_jmp(&xedd);
-							original_target_of_tail=curr_bbl.next_ins;
-							cerr << "REORDERING!! head address is:  "<<std::hex<< head_address << " tail address is: " << tail_address<< endl;
-							//xedd = rtn_local_instrs_map[tail_address];//*************FIX THIS to inverted jmp*************************	
-							if(tmp_rtn_bbls_map.find(curr_bbl.target)!=tmp_rtn_bbls_map.end()){//check if the new FT target was already added
+							
+							if(tmp_rtn_bbls_map.find(curr_bbl.target)!=tmp_rtn_bbls_map.end()){//check if the new FT target was not already added
 								next_bbl=tmp_rtn_bbls_map[curr_bbl.target];// declare next bbl to be the jump target FT
-								rtn_map[RTN_Address(rtn)]->rtn_bbls_map[curr_bbl.target].was_reordered=1;// this symbolizes that the BBL is not in it's original place and might need a jmp at the end to it;s FT
+								invert_jmp(&xedd);// OUR FUNCTION
+								original_target_of_tail=curr_bbl.next_ins;
+					//			cerr << "REORDERING!! head address is:  "<<std::hex<< head_address << " tail address is: " << tail_address<< endl;
+								//rtn_map[RTN_Address(rtn)]->rtn_bbls_map[curr_bbl.target].was_reordered=1;// this symbolizes that the BBL is not in it's original place and might need a jmp at the end to it;s FT
 							}
 							else{
 								next_bbl=tmp_rtn_bbls_map.begin()->second;
-								//tmp_rtn_bbls_map.begin()
-							}
+								changed_FT=true;
+								}
 							
 
 							
@@ -1149,34 +1327,50 @@ cerr << "before for" << endl;
 							}
 							else{
 								next_bbl=tmp_rtn_bbls_map.begin()->second;//if the wanted FT was already inserted, just take another unrelated bbl from the map.
+								changed_FT=true;
 							}
 						}
 						else{
 							//if the next instruction is NOT in the same routine, we want to take the first BBL from the top
 							
 							next_bbl=tmp_rtn_bbls_map.begin()->second;
+							changed_FT=true;
 						}
 					
 					
 					}
 					//insert the tail to the map
-
 				   if (KnobVerbose) {
 					 char disasm_buf[2048];
 					 xed_format_context(XED_SYNTAX_INTEL, &xedd, disasm_buf, 2048, static_cast<UINT64>(addr), 0, 0);               
 					 cerr << "0x" << hex << addr << ": " << disasm_buf  <<  endl; 
 				   }
-				   //insert 
+				   //insert the inverted branch inst:
 					int rc = add_new_instr_entry(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,original_target_of_tail);
+					test_map.erase(addr);
 					if (rc < 0) {
 						cerr << "ERROR: failed during instructon translation." << endl;
-						translated_rtn[rtn_num].instr_map_entry = -1;
+						translated_rtn[translated_rtn_num].instr_map_entry = -1;
 						break;
 					}
+											
+					// check if the next BBL is the original FT. if not, add a jmp instruction to the original FT 
+					if(curr_bbl.next_ins != next_bbl.head_address && changed_FT){
 					
-				//	if(rtn_map[RTN_Address(rtn)]->rtn_bbls_map[head_address].was_reordered==1 || rtn_map[RTN_Address(rtn)]->rtn_bbls_map[curr_bbl.next_ins].was_reordered==1){
-					
-					if(curr_bbl.next_ins != next_bbl.head_address){// check if the next BBL is the original FT. if not, add a jmp instruction to the original FT 
+						add_final_jmp(&xedd); // OUR FUNCTION
+						if (KnobVerbose) {
+						 char disasm_buf[2048];
+						 xed_format_context(XED_SYNTAX_INTEL, &xedd, disasm_buf, 2048, static_cast<UINT64>(addr), 0, 0);               
+						 cerr << "0x" << hex << addr << ": " << disasm_buf  <<  endl; 
+					   }
+					   //insert the jmp inst:
+						int rc = add_new_instr_entry(&xedd, 0, xed_decoded_inst_get_length(&xedd),0,curr_bbl.next_ins);
+						if (rc < 0) {
+							cerr << "ERROR: failed during instructon translation." << endl;
+							translated_rtn[translated_rtn_num].instr_map_entry = -1;
+							break;
+						}
+						
 					// *****************ADD JUMP INSTRUCTION*******************************************
 					// *****************ADD JUMP INSTRUCTION*******************************************
 					// *****************ADD JUMP INSTRUCTION*******************************************
@@ -1189,10 +1383,32 @@ cerr << "before for" << endl;
 					first_ins = RTN_InsHead(rtn);			
 					head_address=curr_bbl.head_address;
 					tail_address=curr_bbl.tail_address;
+					changed_FT=false;
+				}
+				
+				//PRINT test_map to see if there are any instructions left at the end
+				// and insert them into the entry map
+				//cerr << "THESE ARE THE ADDRESSES IN THE LOCAL RTN_MAP after the insertion FOR RTN:  " << RTN_Name(rtn)<< endl;
+				for(const auto& pair : test_map) {
+					//cerr << std::hex<<pair.first << endl;
+					ADDRINT addr = pair.first;
+					xed_decoded_inst_t xedd = pair.second; 
+					if (KnobVerbose) {
+					 char disasm_buf[2048];
+					 xed_format_context(XED_SYNTAX_INTEL, &xedd, disasm_buf, 2048, static_cast<UINT64>(addr), 0, 0);               
+					 cerr << "0x" << hex << addr << ": " << disasm_buf  <<  endl; 
+				   }
+				   //insert the jmp inst:
+					int rc = add_new_instr_entry(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,0);
+					if (rc < 0) {
+						cerr << "ERROR: failed during instructon translation." << endl;
+						translated_rtn[translated_rtn_num].instr_map_entry = -1;
+						break;
+					}
 				}
 					
 
-					
+				
 					
 					
 		
@@ -1364,7 +1580,30 @@ cerr << "before for" << endl;
       
        
      // end for map<...
+	 //bbb
+	 /*
+	 	ADDRINT rtn_addr; 
+	USIZE rtn_size;
+	int instr_map_entry;   // negative instr_map_entry means routine does not have a translation.
+	bool isSafeForReplacedProbe;	
+} translated_rtn_t;
+	 */
+	 
+	 /*
+	 cout << "PRINTING ROUTINE STRUCT:  " << endl;
+	 cout << "translated_rtn_num: " << translated_rtn_num << endl;
+	  cout << "rtn_num: " << rtn_num << endl;
+	 
 
+	 for(int k =0; k<translated_rtn_num;++k){
+		 cout << std::hex <<" rtn_address: " <<  translated_rtn[k].rtn_addr 
+			  << std::dec <<" rtn_size: " <<  translated_rtn[k].rtn_size
+			  << " instr_map_entry: " <<  translated_rtn[k].instr_map_entry
+			  << " isSafeForReplacedProbe: " <<  translated_rtn[k].isSafeForReplacedProbe
+			  << endl;
+		 
+	 }
+	*/
     return 0;
 }
 /***************************/
@@ -1570,7 +1809,7 @@ VOID ImageLoad(IMG img, VOID *v)
 	   cerr << "Translation Cache dump:" << endl;
        dump_tc();  // dump the entire tc
 
-	   cerr << endl << "instructions map dump:" << endl;
+	 //  cerr << endl << "instructions map dump:" << endl;
 	   dump_entire_instr_map();     // dump all translated instructions in map_instr
    }
 
@@ -1602,8 +1841,15 @@ INT32 Usage()
 /* ===================================================================== */
 
 VOID docount(unsigned int *counter_pointer) { (*counter_pointer)++; }
-
-
+VOID call_counter (ADDRINT call_addr,ADDRINT targ_address){ call_vector.push_back(make_pair(call_addr,targ_address));}
+VOID Taken_count(unsigned int *taken_count , unsigned int *not_taken_count ,INT32 is_taken) { 
+	if(is_taken){
+		(*taken_count)++;
+	}
+	else{
+		(*not_taken_count)++;
+	}
+ }
 /* ===================================================================== */
 
 /* ===================================================================== */
@@ -1621,7 +1867,7 @@ VOID ROUTINE(RTN my_rtn, VOID* v) {
 	rtn->instructions_num = 0;
 	rtn->calls_num = 0;
 		
-	//checkt that thr routine is valid and that it is in the main executable image
+	//check that thr routine is valid and that it is in the main executable image
 	if (RTN_Valid(my_rtn) && IMG_IsMainExecutable(img)) {
 		RTN_Open(my_rtn);
 		//count the amount of calls to this routine
@@ -1629,6 +1875,13 @@ VOID ROUTINE(RTN my_rtn, VOID* v) {
 		//count the amount of instructions in this routine
 		for (INS ins =RTN_InsHead(my_rtn); INS_Valid(ins); ins = INS_Next(ins)) {
 			INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount,IARG_PTR, &(rtn->instructions_num), IARG_END);	
+			if(INS_IsCall(ins) && INS_IsDirectControlFlow(ins)){
+				//ADDRINT targ_addr=INS_DirectControlFlowTargetAddress(ins);
+				INS_InsertCall(ins,IPOINT_BEFORE,AFUNPTR(call_counter)
+				,IARG_ADDRINT,INS_Address(ins)
+				,IARG_BRANCH_TARGET_ADDR
+				,IARG_END);
+			}
 		}
 	
 	//add the routine to the map
@@ -1637,14 +1890,7 @@ VOID ROUTINE(RTN my_rtn, VOID* v) {
 	}		
 }
 /* ===================================================================== */
-VOID Taken_count(unsigned int *taken_count , unsigned int *not_taken_count ,INT32 is_taken) { 
-	if(is_taken){
-		(*taken_count)++;
-	}
-	else{
-		(*not_taken_count)++;
-	}
- }
+
 /* ===================================================================== */
 
 VOID TRACE_INSTRUMENTATION(TRACE trace, VOID *v) {
@@ -1711,24 +1957,68 @@ VOID TRACE_INSTRUMENTATION(TRACE trace, VOID *v) {
 VOID Fini(INT32 code, VOID* v) { 
 	
 	
+	// count the "call" instruction in each routine
+	/*
+		for(const auto& pair: call_vector){
+		if(rtn_map.find(pair.second)==rtn_map.end()) {continue;}
+		else{
+			if(rtn_map[pair.second]->calls_map.find(pair.first)==rtn_map[pair.second]->calls_map.end()){
+				rtn_map[pair.second]->calls_map[pair.first]=1;
+			}
+			else{
+				rtn_map[pair.second]->calls_map[pair.first]+=1;
+			}
+		}
+	}
+	*/
+	
+	//count the bbls in each routine 
 	vector<pair<unsigned int, bbl_st*>> bbl_vec(bbl_map.begin(), bbl_map.end());
 // insert the bbl's to their routines 
+	unsigned long sum_taken_count=0;
+	unsigned long sum_not_taken_count=0;
+	
 	for (const pair<const unsigned int, bbl_st*>& pair : bbl_vec) {
 		const bbl_st& current_bbl = *(pair.second);
 		ADDRINT current_rtn_addr = current_bbl.routine_address;		
 		if(rtn_map.find(current_rtn_addr)==rtn_map.end()){continue;}//check if routine has been translated
-			//insert all the bbls to theire respective rtns. in case of 2 bbls with the same tail, take the one the contains the other (smalles head address)
-			if(rtn_map[current_rtn_addr]->rtn_bbls_map.find(current_bbl.tail_address)==rtn_map[current_rtn_addr]->rtn_bbls_map.end()){
+		//insert all the bbls to their respective rtns. in case of 2 bbls with the same tail, take the one that contains the other (smallest head address)
+		if(rtn_map[current_rtn_addr]->rtn_bbls_map.find(current_bbl.tail_address)==rtn_map[current_rtn_addr]->rtn_bbls_map.end()){
+			rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address]=current_bbl;
+		}
+		else{
+			sum_taken_count		=	rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address].taken_count 		  +	current_bbl.taken_count;
+			sum_not_taken_count	=	rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address].not_taken_count + current_bbl.not_taken_count;
+			if(rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address].head_address > current_bbl.head_address){
 				rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address]=current_bbl;
 			}
-			else{
-				if(rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address].head_address > current_bbl.head_address){
-					rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address]=current_bbl;
-				}
-			}
+			rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address].taken_count=sum_taken_count;
+			rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.tail_address].not_taken_count=sum_not_taken_count;
+		}
 			
 			
 	}
+	
+	/*for (const pair<const unsigned int, bbl_st*>& pair : bbl_vec) {
+		const bbl_st& current_bbl = *(pair.second);
+		ADDRINT current_rtn_addr = current_bbl.routine_address;		
+		if(rtn_map.find(current_rtn_addr)==rtn_map.end()){continue;}//check if routine has been translated
+		//insert all the bbls to their respective rtns. in case of 2 bbls with the same tail, take the one that contains the other (smallest head address)
+		if(rtn_map[current_rtn_addr]->rtn_bbls_map.find(current_bbl.head_address)==rtn_map[current_rtn_addr]->rtn_bbls_map.end()){
+			rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.head_address]=current_bbl;
+		}
+		else{
+			sum_taken_count		=	rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.head_address].taken_count 		  +	current_bbl.taken_count;
+			sum_not_taken_count	=	rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.head_address].not_taken_count + current_bbl.not_taken_count;
+			if(rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.head_address].head_address > current_bbl.head_address){
+				rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.head_address]=current_bbl;
+			}
+			rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.head_address].taken_count=sum_taken_count;
+			rtn_map[current_rtn_addr]->rtn_bbls_map[current_bbl.head_address].not_taken_count=sum_not_taken_count;
+		}
+			
+			
+	}*/
 
 	// change the bbl map to keys with head address instead of tail address:
 	
@@ -1747,12 +2037,17 @@ VOID Fini(INT32 code, VOID* v) {
 	// sort the map by ins_count
 	// create a vector from the pairs of the map
 	vector<pair<unsigned int, rtn_st*>> sorted_vec(rtn_map.begin(), rtn_map.end());
+	unsigned long total_inst_sum=0;
+	unsigned long total_calls_num=0;
+	unsigned long mean_calls=0;
 	//use std::sort and my comapre function to sort the vector by instruction_num 
-	sort(sorted_vec.begin(), sorted_vec.end(), compare_rtn);
+	sort(sorted_vec.begin(), sorted_vec.end(), compare_rtn_by_inst);
 	//print the sorted map
 	ofstream output("loop-count.csv");
 	for (const pair<const unsigned int, rtn_st*>& pair : sorted_vec) {
 		const rtn_st& data = *(pair.second); 
+		total_inst_sum+=data.instructions_num;
+		total_calls_num+=data.calls_num;
 		if(data.calls_num != 0) { 
 
 			output
@@ -1768,14 +2063,47 @@ VOID Fini(INT32 code, VOID* v) {
 			<< data.calls_num
 			<<std::hex;
 // print all the tails of the bbls in the routine:
-			for (const auto& pair2 : data.rtn_bbls_map) {
-				ADDRINT head_addr=pair2.first;
-				output << " , " << "0x" << head_addr << " ";
+			for(const auto& pair2: data.calls_map ){
+				output << " , " <<  std::hex << "0x" << pair2.first << " , " << std::dec <<pair2.second ;
 			}
 			output<<endl;
 		}
 	}
 	output.close();
+
+	
+	/////////////////FIND HOT CALLS///////////////////////////////////////////////
+	vector<ADDRINT> hot_rtns_vec;
+	map<pair<ADDRINT,ADDRINT>,unsigned long> call_pairs_count_map;
+	unsigned int dominant_threshold=2;
+	mean_calls=total_calls_num/sorted_vec.size();
+	mean_calls=total_calls_num/sorted_vec.size();
+	cout <<"MEAN calls: " << mean_calls << endl;
+	sort(sorted_vec.begin(), sorted_vec.end(), compare_rtn_by_calls);
+	unsigned int k=0;
+	while((sorted_vec[k].second->calls_num 	>	 static_cast<unsigned long>(mean_calls)) && (k<(sorted_vec.size()))){// find the hot routines
+		hot_rtns_vec.push_back(sorted_vec[k].first);
+		k++;
+	}
+	cout << "HOT_RTNS_NUM= " << hot_rtns_vec.size() << endl;
+	
+	for(const auto& pair : call_vector) { //count the amount of calls to a routine from a specific address
+	
+	call_pairs_count_map[pair]++;
+    }
+	
+	for(const auto& pair : call_pairs_count_map) {
+		ADDRINT call_address=pair.first.first;
+		ADDRINT targ_addr = pair.first.second;
+		unsigned long curr_call_count=pair.second;
+		if(rtn_map.find(targ_addr)==rtn_map.end()){continue;}
+		if((std::find(hot_rtns_vec.begin(), hot_rtns_vec.end(), targ_addr) != hot_rtns_vec.end()) && (curr_call_count > rtn_map[targ_addr]->calls_num/dominant_threshold)){
+			hot_calls_set.insert(call_address);
+			cout << "HOT CALL: " << std::hex << call_address << endl;
+		}
+    }
+
+	
 ///////////////////////////PRINT BBL MAP//////////////////////////////////////////
 
 	
@@ -1824,29 +2152,8 @@ int main(int argc, char * argv[])
         return Usage();
 
     PIN_InitSymbols();
-    if(KnobInst){
-	//read the csv here 
-/*
-	//V2
-	FILE* file =fopen("loop-count.csv" ,"r");
-	if(file){
-		ADDRINT addr;
-		int count=0;
-		//take only the first column and drop the rest until a newline
-		while(std::fscanf(file,"0x%lx%*[^\n]%*c",&addr) !=EOF &&count<10){
-			hot_rtn_addr.push_back(addr);
-			count++;
-		}
-		fclose(file);
-	} else {
-		cout<<"could not open file"<< endl;
-	}
-	//for( size_t i=0; i<hot_rtn_addr.size();i++){
-	//	cout<<hot_rtn_addr[i]<<endl;
-	//}
-	//
-	 //Register ImageLoad
-	 */
+    if(KnobOpt){
+
 	IMG_AddInstrumentFunction(ImageLoad, 0);
 	PIN_StartProgramProbed();
     }
@@ -1857,19 +2164,7 @@ int main(int argc, char * argv[])
 		PIN_StartProgram();
 	}
     else{
-/*
-	ifstream infile("loop-count.csv");
-	string line;
-	string field;
-	for(int i =0; i<10;i++){
-		getline(infile, line);
-		istringstream s(line);//create a string stream of each line
-		getline(s,field,',');//take the first field of each line
- 		//cout << stoul(field,nullptr,16) <<endl;
-		ADDRINT addr=std::stoull(field,nullptr,16);
-		hot_rtn_addr.push_back(addr);
-	}
-*/
+
 
 	PIN_StartProgramProbed();
 	}
