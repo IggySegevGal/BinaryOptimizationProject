@@ -66,6 +66,7 @@ extern "C" {
 #include <map>
 #include <algorithm>
 #include <unordered_set>
+#include <chrono>
 
 
 using namespace std;
@@ -129,7 +130,7 @@ std::ofstream* out = 0;
 map <ADDRINT,rtn_st*> rtn_map;
 map <ADDRINT,bbl_st*> bbl_map;
 vector<pair<ADDRINT,ADDRINT>> call_vector;
-unordered_set<ADDRINT> hot_calls_set;
+vector<ADDRINT> hot_calls_vector;
 
 
 // For XED:
@@ -171,6 +172,7 @@ typedef struct {
 typedef struct { 
 	ADDRINT orig_ins_addr;
 	ADDRINT orig_targ_addr;
+	//xed_decoded_inst_t xedd;
 } tmp_instr_map_t;
 
 instr_map_t *instr_map = NULL;
@@ -193,6 +195,7 @@ typedef struct {
 
 translated_rtn_t *translated_rtn;
 int translated_rtn_num = 0;
+map <ADDRINT,pair<int,int> > tmp_rtn_map;// map that has the rtn_address of each rtn as key and as value it has a pair: < first index in the temp inst_map_entry,last index in the temp inst_map_entry >
 
 
 
@@ -272,15 +275,14 @@ void writeBinary(const std::string& filePath) {
         }
     }
 	
-	// Write the number of elements in hot_calls_set
-	size_t numHotCalls = hot_calls_set.size();
+	size_t numHotCalls = hot_calls_vector.size();
 	outFile.write(reinterpret_cast<const char*>(&numHotCalls), sizeof(numHotCalls));
 
-	// Write hot_calls_set data
-	for(const auto& callAddr : hot_calls_set) {
+	// Write hot_calls_vector data
+	for(const auto& callAddr : hot_calls_vector) {
 		outFile.write(reinterpret_cast<const char*>(&callAddr), sizeof(callAddr));
 	}
-
+	
     outFile.close();
 }
 
@@ -336,19 +338,20 @@ void readBinary(const std::string& filePath) {
         rtn_map[routineData->routine_address] = routineData;
     }
 	
-	// Read number of elements in hot_calls_set
+// Read number of elements in hot_calls_vector
 	size_t numHotCalls;
 	inFile.read(reinterpret_cast<char*>(&numHotCalls), sizeof(numHotCalls));
 
-	// Read hot_calls_set data
+	// Read hot_calls_vector data
+	hot_calls_vector.resize(numHotCalls); // Ensure there's enough space in the vector
 	for(size_t i = 0; i < numHotCalls; ++i) {
 		ADDRINT callAddr;
 		inFile.read(reinterpret_cast<char*>(&callAddr), sizeof(callAddr));
 
-		// Add data to hot_calls_set
-		hot_calls_set.insert(callAddr);
+		// Add data to hot_calls_vector
+		hot_calls_vector[i] = callAddr;
 	}
-
+	
     inFile.close();
 }
 /*************************/
@@ -679,7 +682,6 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size 
 		cerr << "Invalid instruction decoding" << endl;
 		return -1;
 	}
-	
 
 	if(orig_targ_addr==0){
 		xed_uint_t disp_byts = xed_decoded_inst_get_branch_displacement_width(xedd);
@@ -690,10 +692,15 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size 
 		}
 	}
 
-
 	// Converts the decoder request to a valid encoder request:
+	if (xedd != NULL) {
+		xed_encoder_request_init_from_decode(xedd);
+	} else {
+		// Handle the error or print a warning.
+	}
+	
+	
 	xed_encoder_request_init_from_decode (xedd);
-
     unsigned int new_size = 0;
 	
 	xed_error_enum_t xed_error = xed_encode (xedd, reinterpret_cast<UINT8*>(instr_map[num_of_instr_map_entries].encoded_ins), max_inst_len , &new_size);
@@ -701,7 +708,6 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size 
 		cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;		
 		return -1;
 	}	
-	
 	// add a new entry in the instr_map:
 	
 	instr_map[num_of_instr_map_entries].orig_ins_addr = pc;
@@ -712,7 +718,6 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size 
 	instr_map[num_of_instr_map_entries].size = new_size;	
     instr_map[num_of_instr_map_entries].category_enum = xed_decoded_inst_get_category(xedd);
 	instr_map[num_of_instr_map_entries].inline_index = inline_counter;//OUR ADDITION
-
 	num_of_instr_map_entries++;
 
 	// update expected size of tc:
@@ -723,7 +728,6 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size 
 		return -1;
 	}
 	
-
     // debug print new encoded instr:
 	if (KnobVerbose) {
 		cerr << "    new instr:";
@@ -735,42 +739,12 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size 
 /*************************************************/
 /* add_new_instr_entry() TO TMP MAP (TO BE USED BETWEEN REORDER AND INLINE PHASES) */
 /*************************************************/
-void add_new_instr_entry_to_tmp_map(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size , int inline_counter , ADDRINT orig_targ_addr)
+/*
+void add_new_instr_entry_to_tmp_map( ADDRINT pc , ADDRINT orig_targ_addr)
 {
 
-	// copy orig instr to instr map:
-	if (xed_decoded_inst_get_length (xedd) != size) {
-		cerr << "Invalid instruction decoding in tmp map " << endl;
-	}
-	
-
-	if(orig_targ_addr==0){
-		xed_uint_t disp_byts = xed_decoded_inst_get_branch_displacement_width(xedd);
-		xed_int32_t disp;
-		if (disp_byts > 0) { // there is a branch offset.
-			disp = xed_decoded_inst_get_branch_displacement(xedd);
-			orig_targ_addr = pc + xed_decoded_inst_get_length (xedd) + disp;	
-		}
-	}
-
-	// add a new entry in the instr_map:
-	
-	instr_map[num_of_instr_map_entries_tmp].orig_ins_addr = pc;
-	instr_map[num_of_instr_map_entries_tmp].orig_targ_addr = orig_targ_addr; 
-
-	num_of_instr_map_entries++;
-
-	if (num_of_instr_map_entries_tmp >= max_ins_count) {
-		cerr << "out of memory for map_instr IN TMP MAP" << endl;
-	}
-	
-
-    // debug print new encoded instr:
-	if (KnobVerbose) {
-		cerr << "    new instr in tmp map :";
-		dump_instr_from_mem((ADDRINT *)instr_map[num_of_instr_map_entries_tmp-1].encoded_ins, instr_map[num_of_instr_map_entries_tmp-1].new_ins_addr);
-	}
 }
+*/
 /*************************************************/
 /* chain_all_direct_br_and_call_target_entries() */
 /*************************************************/
@@ -882,7 +856,7 @@ int fix_rip_displacement(int instr_map_entry)
 /************************************/
 int fix_direct_br_call_to_orig_addr(int instr_map_entry)
 {
-
+	//bla
 	xed_decoded_inst_t xedd;
 	xed_decoded_inst_zero_set_mode(&xedd,&dstate); 
 				   
@@ -893,25 +867,34 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
 	}
 	
 	xed_category_enum_t category_enum = xed_decoded_inst_get_category(&xedd);
-	
-	if (category_enum != XED_CATEGORY_CALL && category_enum != XED_CATEGORY_UNCOND_BR) {
 
-		cerr << "ERROR: Invalid direct jump from translated code to original code in rotuine: " 
-			  << RTN_Name(RTN_FindByAddress(instr_map[instr_map_entry].orig_ins_addr)) 
+	if (category_enum != XED_CATEGORY_CALL && category_enum != XED_CATEGORY_UNCOND_BR) {
+		cerr << "ERROR: Invalid direct jump from translated code to original code, " 
+			  << " instruction_entry: "<< instr_map_entry
 			  << " original address: "<<instr_map[instr_map_entry].orig_ins_addr
 			  << " original target address: "<<instr_map[instr_map_entry].orig_targ_addr
+			 
 			  <<endl;
+
+			  
 		cerr<< "the instruction map is: " << endl;
+		
 		for(int i = 0; i<num_of_instr_map_entries;i++){
+			const char* category_name = xed_category_enum_t2str(instr_map[i].category_enum);
+
 			cerr << " entry_num: " << i 
-				 <<	" orig_ins_addr: " << instr_map[i].orig_ins_addr 
+				 <<std::hex <<	" orig_ins_addr: " << instr_map[i].orig_ins_addr 
 				 << " new_ins_addr: "  << instr_map[i].new_ins_addr
 				 << " hasNewTargAddr: "<< instr_map[i].hasNewTargAddr
 				 << " orig_targ_addr: "<< instr_map[i].orig_targ_addr
+				  << " category: " << category_name
 				 <<endl;
 		}
-		dump_instr_map_entry(instr_map_entry);
+		
+		//dump_instr_map_entry(instr_map_entry);
 		return -1;
+				cout << "l2" << endl;
+
 		/*
 			instr_map[num_of_instr_map_entries].orig_ins_addr = pc;
 	instr_map[num_of_instr_map_entries].new_ins_addr = (ADDRINT)&tc[tc_cursor];  // set an initial estimated addr in tc
@@ -950,7 +933,6 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
 			XED_ICLASS_JMP, 64,
 			xed_mem_bd (XED_REG_RIP, xed_disp(new_disp, 32), 64));
 
-
 	xed_encoder_request_t enc_req;
 
 	xed_encoder_request_zero_set_mode(&enc_req, &dstate);
@@ -967,7 +949,6 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
 	    dump_instr_map_entry(instr_map_entry); 
         return -1;
     }
-
 	// handle the case where the original instr size is different from new encoded instr:
 	if (olen != xed_decoded_inst_get_length (&xedd)) {
 		
@@ -999,7 +980,6 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
 			return -1;
 		}		
 	}
-
 	
 	// debug prints:
 	if (KnobVerbose) {
@@ -1016,7 +996,6 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
 /***********************************/
 int fix_direct_br_call_displacement(int instr_map_entry) 
 {					
-
 	xed_decoded_inst_t xedd;
 	xed_decoded_inst_zero_set_mode(&xedd,&dstate); 
 				   
@@ -1071,7 +1050,7 @@ int fix_direct_br_call_displacement(int instr_map_entry)
 
 	xed_uint8_t enc_buf[XED_MAX_INSTRUCTION_BYTES];
 	unsigned int max_size = XED_MAX_INSTRUCTION_BYTES;
-    
+
 	xed_error_enum_t xed_error = xed_encode (&xedd, enc_buf, max_size , &new_size);
 	if (xed_error != XED_ERROR_NONE) {
 		cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) <<  endl;
@@ -1087,7 +1066,7 @@ int fix_direct_br_call_displacement(int instr_map_entry)
 
 	//Set the branch displacement:
 	xed_encoder_request_set_branch_displacement (&xedd, new_disp, new_disp_byts);
-	
+
 	xed_error = xed_encode (&xedd, reinterpret_cast<UINT8*>(instr_map[instr_map_entry].encoded_ins), size , &new_size); // &instr_map[i].size
 	if (xed_error != XED_ERROR_NONE) {
 		cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
@@ -1127,7 +1106,7 @@ int fix_instructions_displacements()
 				   
 			int new_size = 0;
 
-			// fix rip displacement:			
+			// fix rip displacement:	
 			new_size = fix_rip_displacement(i);
 			if (new_size < 0)
 				return -1;
@@ -1148,16 +1127,14 @@ int fix_instructions_displacements()
 			}
 
 
-			// fix instr displacement:			
+			// fix instr displacement:		
 			new_size = fix_direct_br_call_displacement(i);
 			if (new_size < 0)
 				return -1;
-
 			if (instr_map[i].size != (unsigned int)new_size) {
 			   size_diff += (new_size - instr_map[i].size);
 			   instr_map[i].size = (unsigned int)new_size;
 			}
-
 		}  // end int i=0; i ..
 
 	} while (size_diff != 0);
@@ -1174,6 +1151,8 @@ int find_candidate_rtns_for_translation(IMG img)
     map<ADDRINT, xed_decoded_inst_t> local_instrs_map;
     local_instrs_map.clear();
 	map<ADDRINT, xed_decoded_inst_t> rtn_local_instrs_map;
+	map<ADDRINT, xed_decoded_inst_t> global_xedd_map;
+	ADDRINT jmp_counter=1;
     // go over routines and check if they are candidates for translation and mark them for translation:
     for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec))
     {   
@@ -1193,23 +1172,20 @@ int find_candidate_rtns_for_translation(IMG img)
 			if(rtn_map[RTN_Address(rtn)]->rtn_bbls_map.empty()==true){
 				continue;
 			}
-			//if(((RTN_Name(rtn)!="mmed3")) ){ //RTN_Name(rtn)!= "hasSuffix" && 
-			//	continue;
-			//}
+			if((((RTN_Name(rtn)=="_real_fini") || (RTN_Name(rtn)=="_fini"))) ){ //RTN_Name(rtn)!= "hasSuffix" && 
+				continue;
+			}
 		// PRINT RTN's NAME
 		//		cout << "RTN_NAME: " << RTN_Name(rtn)<<endl;
 			//	cout << "Address: " << std::hex<<RTN_Address(rtn)<<endl;
 				//cout << "address from map: " << rtn_map[RTN_Address(rtn)]->routine_address << endl;
 				//cout << "ins_num from map: " << rtn_map[RTN_Address(rtn)]->instructions_num << endl;
 
-            translated_rtn[translated_rtn_num].rtn_addr = RTN_Address(rtn);			
-			translated_rtn[translated_rtn_num].rtn_size = RTN_Size(rtn);
-			translated_rtn[translated_rtn_num].instr_map_entry = num_of_instr_map_entries;
-			translated_rtn[translated_rtn_num].isSafeForReplacedProbe = true;	
+
 
             // Open the RTN.
             RTN_Open( rtn ); 
-			//eyal
+			
 			// fill a local map for the current rtn. later it will be reordered and inserted into the instruction map
 				rtn_local_instrs_map.clear();
 				for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
@@ -1229,7 +1205,6 @@ int find_candidate_rtns_for_translation(IMG img)
 					xed_code = xed_decode(&xedd, reinterpret_cast<UINT8*>(addr), max_inst_len);
 					if (xed_code != XED_ERROR_NONE) {
 						cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
-						translated_rtn[translated_rtn_num].instr_map_entry = -1;
 						break;
 					}
 					
@@ -1238,23 +1213,39 @@ int find_candidate_rtns_for_translation(IMG img)
 					
 				} // end for INS...
 				map<ADDRINT, xed_decoded_inst_t> test_map=rtn_local_instrs_map;
-				/*
-				//PRINT THE ROUTINE MAP ADDRESSES	
-				cerr << "THESE ARE THE ADDRESSES IN THE LOCAL RTN_MAP FOR RTN:  " << RTN_Name(rtn)<< endl;
-				for(const auto& pair : rtn_local_instrs_map) {
-					cerr << std::hex<<pair.first << endl;
-				}
-					*/
 				
-				//--------------REORDERING-----------------------------------------------------------------------------------
-								
+				 //---------------DELETE THIS-----------------------------------------------------
+/*
+					for (const auto& pair : rtn_local_instrs_map) {
+						ADDRINT addr = pair.first;
+						xed_decoded_inst_t xedd = pair.second;           
+
+					          //debug print of orig instruction:
+					   if (KnobVerbose) {
+						 char disasm_buf[2048];
+						 xed_format_context(XED_SYNTAX_INTEL, &xedd, disasm_buf, 2048, static_cast<UINT64>(addr), 0, 0);               
+						 cerr << "0x" << hex << addr << ": " << disasm_buf  <<  endl; 
+					   }
+					   //insert 
+					  // add_new_instr_entry_to_tmp_map(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,0);
+					   	tmp_instr_map[num_of_instr_map_entries_tmp].orig_ins_addr = addr;
+						tmp_instr_map[num_of_instr_map_entries_tmp].orig_targ_addr = 0;
+						num_of_instr_map_entries_tmp++;
+						test_map.erase(addr);
+						global_xedd_map[addr] = xedd;
+					}
+			*/	
+				//--------------REORDERING-----------------------------------------------------------------------------------	
 				map<ADDRINT,bbl_st> tmp_rtn_bbls_map = rtn_map[RTN_Address(rtn)]->rtn_bbls_map;
 
-				INS first_ins = RTN_InsHead(rtn);			
+				INS first_ins = RTN_InsHead(rtn);		
 				bbl_st curr_bbl=tmp_rtn_bbls_map[INS_Address(first_ins)];
 				bbl_st next_bbl;
 				ADDRINT head_address=curr_bbl.head_address;
 				ADDRINT tail_address=curr_bbl.tail_address;
+				int rtn_first_entry=num_of_instr_map_entries_tmp;
+				int rtn_last_entry=0;
+				
 				bool  changed_FT=false;
 				while(!tmp_rtn_bbls_map.empty()){
 					ADDRINT original_target_of_tail=0;
@@ -1272,13 +1263,12 @@ int find_candidate_rtns_for_translation(IMG img)
 						 cerr << "0x" << hex << addr << ": " << disasm_buf  <<  endl; 
 					   }
 					   //insert 
-					   	int rc = add_new_instr_entry(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,0);
+					  // add_new_instr_entry_to_tmp_map(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,0);
+					   	tmp_instr_map[num_of_instr_map_entries_tmp].orig_ins_addr = addr;
+						tmp_instr_map[num_of_instr_map_entries_tmp].orig_targ_addr = 0;
+						num_of_instr_map_entries_tmp++;
 						test_map.erase(addr);
-						if (rc < 0) {
-							cerr << "ERROR: failed during instructon translation." << endl;
-							translated_rtn[translated_rtn_num].instr_map_entry = -1;
-							break;
-						}
+						global_xedd_map[addr] = xedd;
 					}
 					
 					tmp_rtn_bbls_map.erase(head_address); //remove the BBL and find the next one
@@ -1346,36 +1336,30 @@ int find_candidate_rtns_for_translation(IMG img)
 					 cerr << "0x" << hex << addr << ": " << disasm_buf  <<  endl; 
 				   }
 				   //insert the inverted branch inst:
-					int rc = add_new_instr_entry(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,original_target_of_tail);
+					//add_new_instr_entry_to_tmp_map(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,original_target_of_tail);
+					tmp_instr_map[num_of_instr_map_entries_tmp].orig_ins_addr = addr;
+					tmp_instr_map[num_of_instr_map_entries_tmp].orig_targ_addr = original_target_of_tail;
+					num_of_instr_map_entries_tmp++;
 					test_map.erase(addr);
-					if (rc < 0) {
-						cerr << "ERROR: failed during instructon translation." << endl;
-						translated_rtn[translated_rtn_num].instr_map_entry = -1;
-						break;
-					}
-											
+					global_xedd_map[addr] = xedd;
 					// check if the next BBL is the original FT. if not, add a jmp instruction to the original FT 
 					if(curr_bbl.next_ins != next_bbl.head_address && changed_FT){
 					
 						add_final_jmp(&xedd); // OUR FUNCTION
+						
 						if (KnobVerbose) {
 						 char disasm_buf[2048];
 						 xed_format_context(XED_SYNTAX_INTEL, &xedd, disasm_buf, 2048, static_cast<UINT64>(addr), 0, 0);               
 						 cerr << "0x" << hex << addr << ": " << disasm_buf  <<  endl; 
 					   }
 					   //insert the jmp inst:
-						int rc = add_new_instr_entry(&xedd, 0, xed_decoded_inst_get_length(&xedd),0,curr_bbl.next_ins);
-						if (rc < 0) {
-							cerr << "ERROR: failed during instructon translation." << endl;
-							translated_rtn[translated_rtn_num].instr_map_entry = -1;
-							break;
-						}
-						
-					// *****************ADD JUMP INSTRUCTION*******************************************
-					// *****************ADD JUMP INSTRUCTION*******************************************
-					// *****************ADD JUMP INSTRUCTION*******************************************
-					// *****************ADD JUMP INSTRUCTION*******************************************
-					// *****************ADD JUMP INSTRUCTION*******************************************
+						//add_new_instr_entry_to_tmp_map(&xedd, 0, xed_decoded_inst_get_length(&xedd),0,curr_bbl.next_ins);
+						tmp_instr_map[num_of_instr_map_entries_tmp].orig_ins_addr = jmp_counter;
+						tmp_instr_map[num_of_instr_map_entries_tmp].orig_targ_addr = curr_bbl.next_ins;
+						global_xedd_map[jmp_counter] = xedd;
+						jmp_counter++;
+						num_of_instr_map_entries_tmp++;
+
 					}
 					// if curr BBL was reordered or the FT was, we need to add a a jump instruction	
 					//CHOOSE THE NEXT BBL 
@@ -1398,212 +1382,151 @@ int find_candidate_rtns_for_translation(IMG img)
 					 xed_format_context(XED_SYNTAX_INTEL, &xedd, disasm_buf, 2048, static_cast<UINT64>(addr), 0, 0);               
 					 cerr << "0x" << hex << addr << ": " << disasm_buf  <<  endl; 
 				   }
-				   //insert the jmp inst:
-					int rc = add_new_instr_entry(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,0);
+				   // add the last instructions
+					//add_new_instr_entry_to_tmp_map(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,0);
+					tmp_instr_map[num_of_instr_map_entries_tmp].orig_ins_addr = addr;
+					tmp_instr_map[num_of_instr_map_entries_tmp].orig_targ_addr = 0;
+					num_of_instr_map_entries_tmp++;
+					global_xedd_map[addr] = xedd;
+				}
+				rtn_last_entry=num_of_instr_map_entries_tmp;
+				tmp_rtn_map[INS_Address(first_ins)]=make_pair(rtn_first_entry,rtn_last_entry);
+				//cout<< " hi " << endl;
+				
+		
+            // Close the RTN.
+            RTN_Close( rtn );
+        } // end for RTN..
+    } // end for SEC...
+
+
+// add insts from tmp map to real map with inlining
+
+
+//eyal
+//
+
+
+	ADDRINT hot_call=hot_calls_vector[1];
+	//cout << "HOT CALL: " <<std::hex << hot_call << endl;
+	for(int i=0;i<num_of_instr_map_entries_tmp;i++){
+		int rc=0;
+		ADDRINT curr_orig_ins_addr=tmp_instr_map[i].orig_ins_addr;
+		ADDRINT curr_orig_targ_addr=tmp_instr_map[i].orig_targ_addr;
+		xed_decoded_inst_t xedd=global_xedd_map[curr_orig_ins_addr];
+		RTN rtn = RTN_FindByAddress(curr_orig_ins_addr);
+
+		//update translated_rtn_map:
+		if(RTN_Valid(rtn)){
+			RTN_Open(rtn);
+			if(curr_orig_ins_addr==INS_Address(RTN_InsHead(rtn)) ){
+//cout << RTN_Name(rtn) << endl;
+
+				translated_rtn[translated_rtn_num].rtn_addr = RTN_Address(rtn);			
+				translated_rtn[translated_rtn_num].rtn_size = RTN_Size(rtn);
+				translated_rtn[translated_rtn_num].instr_map_entry = num_of_instr_map_entries;
+				translated_rtn[translated_rtn_num].isSafeForReplacedProbe = true;	
+				translated_rtn_num++;
+
+			}
+		RTN_Close(rtn);
+		}
+		//cout<<"curr_address: " << curr_orig_ins_addr << endl;
+		if(curr_orig_ins_addr!=hot_call)// check if the instruction is not a hot call that should be inlined 
+		//if (find(hot_calls_vector.begin(), hot_calls_vector.end(), curr_orig_ins_addr) == hot_calls_vector.end())
+		{
+		// in case that it is not a hot call, just insert the instruction:
+
+			rc = add_new_instr_entry(&xedd, curr_orig_ins_addr, xed_decoded_inst_get_length(&xedd),0,curr_orig_targ_addr);
+			if (rc < 0) {
+				cerr << "ERROR: failed during instructon translation." << endl;
+				translated_rtn[translated_rtn_num].instr_map_entry = -1;
+				break;
+			}
+
+		}
+		else{ // THIS IS THE INLINING PART:
+			xed_int64_t disp = xed_decoded_inst_get_branch_displacement(&xedd);
+			ADDRINT target_addr = curr_orig_ins_addr + xed_decoded_inst_get_length (&xedd) + disp;// a call's target address should be a head of a routine
+			//std::cout <<std::hex<< target_addr << " " << endl;
+			
+			if(tmp_rtn_map.find(target_addr)==tmp_rtn_map.end()){// do not inline if we can't find the target routine of this call
+				rc = add_new_instr_entry(&xedd, curr_orig_ins_addr, xed_decoded_inst_get_length(&xedd),0,curr_orig_targ_addr);
+				if (rc < 0) {
+					cerr << "ERROR: failed during instructon translation." << endl;
+					translated_rtn[translated_rtn_num].instr_map_entry = -1;
+					break;
+				}
+				continue;			
+			}
+			
+			inline_counter++;
+			int first_entry=tmp_rtn_map[target_addr].first;
+			int last_entry=tmp_rtn_map[target_addr].second;
+			ADDRINT after_call_addr=tmp_instr_map[i+1].orig_ins_addr;
+			
+			for(int j=first_entry;j<=last_entry;j++){ // all the instructions inside the inlined rtn
+				curr_orig_ins_addr=tmp_instr_map[j].orig_ins_addr;
+				curr_orig_targ_addr=tmp_instr_map[j].orig_targ_addr;
+				xedd=global_xedd_map[curr_orig_ins_addr];
+				ADDRINT inline_targ_addr = 0;
+				xed_category_enum_t category_enum = xed_decoded_inst_get_category(&xedd);
+				xed_uint_t disp_byts = xed_decoded_inst_get_branch_displacement_width(&xedd);//check if the jump target is inside the routine or not
+				xed_int32_t disp;
+				if(category_enum==XED_CATEGORY_RET){ // if the inst is ret, make it a jump to the next instruction after the original call
+
+					add_final_jmp(&xedd);
+					rc = add_new_instr_entry(&xedd, curr_orig_ins_addr, xed_decoded_inst_get_length(&xedd),0,after_call_addr);
 					if (rc < 0) {
 						cerr << "ERROR: failed during instructon translation." << endl;
 						translated_rtn[translated_rtn_num].instr_map_entry = -1;
 						break;
 					}
+					continue;
 				}
-					
+				else if (disp_byts > 0) {
 
-				
-					
-					
-		
-				
-			/*
-            if(RTN_Name=="myMalloc"){
-				INS first_ins = RTN_InsHead(rtn);
-				
-				map<ADDRINT,bbl_st> tmp_rtn_bbls_map = *(rtn_map[RTN_Address(rtn)]->rtn_bbls_map);
-				bbl_st curr_bbl=tmp_rtn_bbls_map[first_ins];
-				ADDRINT head_address=curr_bbl.head_address;
-				ADDRINT tail_address=curr_bbl.tail_address;
-				//iterate over all bbls and insert them to the map
-				while(!tmp_rtn_bbls_map.empty()){
-					// insert all of the bbl's instructions (besides the tail that might change)
-					for (INS ins = head_address; INS_Address(ins)<tail_address; ins = INS_Next(ins)) { 
-						ADDRINT addr = INS_Address(ins);
-						
-						//debug print of orig instruction:
-						if (KnobVerbose) {
-							cerr << "old instr: ";
-							cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) <<  endl;
-							//xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));                               
-						}        
-						
-						xed_decoded_inst_t xedd;
-						xed_error_enum_t xed_code;                            
-						
-						xed_decoded_inst_zero_set_mode(&xedd,&dstate); 
-
-						xed_code = xed_decode(&xedd, reinterpret_cast<UINT8*>(addr), max_inst_len);
-						if (xed_code != XED_ERROR_NONE) {
-							cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
+					//check if the instruction is is a branch
+					disp = xed_decoded_inst_get_branch_displacement(&xedd);
+					inline_targ_addr = curr_orig_ins_addr + xed_decoded_inst_get_length (&xedd) + disp;
+					if(RTN_FindByAddress(inline_targ_addr) == RTN_FindByAddress(curr_orig_ins_addr)){
+						// check if the target of a jmp is inside the rtn, if it is insert the instruction with inline counter!=0 so that it jumps inside the inlined rtn
+						rc = add_new_instr_entry(&xedd, curr_orig_ins_addr, xed_decoded_inst_get_length(&xedd),inline_counter,curr_orig_targ_addr);
+						if (rc < 0) {
+							cerr << "ERROR: failed during instructon translation." << endl;
 							translated_rtn[translated_rtn_num].instr_map_entry = -1;
 							break;
 						}
-						
-						// Save xed and addr into a map to be used later.
-						local_instrs_map[addr] = xedd;
 					}
-					//INSERT THE CORRECT TAIL (depends on the bbl's head of taken/fallthrough)
-					if(curr_bbl.taken_count > curr_bbl.not_taken_count){
-						//insert inverted jump
-					}
-					else{
-						//insert regular jump
-						
-					}
-					
-					
-				}
-			}
-			*/
-		// test for no reordering	
-		/*
-    for(const auto& pair : rtn_local_instrs_map) {
-        local_instrs_map.insert(pair);
-    }*/
-
-
-
-            // debug print of routine name:
-            if (KnobVerbose) {
-                cerr <<   "rtn name: " << RTN_Name(rtn) << " : " << dec << translated_rtn_num << endl;
-            }            
-
-            // Close the RTN.
-            RTN_Close( rtn );
-
-            translated_rtn_num++;
-
-        } // end for RTN..
-    } // end for SEC...
-
-
-    // Go over the local_instrs_map map and add each instruction to the instr_map:
-/*    
-    for (map<ADDRINT, xed_decoded_inst_t>::iterator iter = local_instrs_map.begin(); iter != local_instrs_map.end(); iter++) {
-       ADDRINT addr = iter->first;
-       xed_decoded_inst_t xedd = iter->second;           
-
-       // Check if we are at a routine header:
-       if (translated_rtn[rtn_num].rtn_addr == addr) {
-           translated_rtn[rtn_num].instr_map_entry = num_of_instr_map_entries;
-           translated_rtn[rtn_num].isSafeForReplacedProbe = true;
-           rtn_num++;
-       }
-    
-       //debug print of orig instruction:
-       if (KnobVerbose) {
-         char disasm_buf[2048];
-         xed_format_context(XED_SYNTAX_INTEL, &xedd, disasm_buf, 2048, static_cast<UINT64>(addr), 0, 0);               
-         cerr << "0x" << hex << addr << ": " << disasm_buf  <<  endl; 
-       }
-      */
-       
-       /* ///////////////////////////// delete hereeeeeeeeeee
-       // Check if this is a direct call instr:    
-		xed_category_enum_t category_enum = xed_decoded_inst_get_category(&xedd);
-		xed_int64_t disp = xed_decoded_inst_get_branch_displacement(&xedd);
-		ADDRINT target_addr = addr + xed_decoded_inst_get_length (&xedd) + disp;
-		RTN rtn = RTN_FindByAddress(target_addr);
-		
-		if ((category_enum == XED_CATEGORY_CALL ) && ((RTN_Name(rtn) == "add_pair_to_block") || RTN_Name(rtn) == "BZ2_blockSort")) { 
-			inline_counter++;
-			cerr<<"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"<<endl;
-			cerr<<RTN_Name(rtn)<<endl;
-			cerr<< " caller address: " <<addr<<endl;
-			cerr<<" caller_rtn: "<<RTN_Name(RTN_FindByAddress(addr))<<endl;
-			cerr<<" inline counter: "<< inline_counter<<endl;
-			cerr<<"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"<<endl;
-
-			//THIS IS THE INLINING PART
-			RTN_Open(rtn);  	  
-			for (INS ins = RTN_InsHead(rtn); !INS_IsRet(ins); ins = INS_Next(ins)) {
-                ADDRINT addr = INS_Address(ins);
-			    xed_decoded_inst_t inline_xedd =local_instrs_map[addr]; // TAKE THE XEDD OF THE INST FROM THE LOCAL MAP
-			   	xed_uint_t disp_byts = xed_decoded_inst_get_branch_displacement_width(&inline_xedd);//check if the jump target is inside the routine or not
-				xed_int32_t disp;
-				ADDRINT inline_targ_addr = 0;
-				if (disp_byts > 0) { // there is a branch offset.
-					disp = xed_decoded_inst_get_branch_displacement(&inline_xedd);
-					inline_targ_addr = addr + xed_decoded_inst_get_length (&inline_xedd) + disp;
-					if(RTN_FindByAddress(inline_targ_addr)==rtn){ // the jump target is inside the inlined function
-						//insert with inline_counter != 0 (to match with inlined code and not original code)
-						int rc = add_new_instr_entry(&inline_xedd, addr, xed_decoded_inst_get_length(&inline_xedd),inline_counter,0);//ADD THE INST TO THE GLOBAL MAP
+					else{ // if the jmp target is outside of the inlined routine, giive it inline_counter=0 so that it jumps as it used to in the original code
+						rc = add_new_instr_entry(&xedd, curr_orig_ins_addr, xed_decoded_inst_get_length(&xedd),0,curr_orig_targ_addr);
 						if (rc < 0) {
 							cerr << "ERROR: failed during instructon translation." << endl;
-							translated_rtn[rtn_num].instr_map_entry = -1;
+							translated_rtn[translated_rtn_num].instr_map_entry = -1;
 							break;
 						}
 					}
-					else { // jump is outside of the inlined code (current rtn)
-						//insert with inline_counter == 0 (to match with original code)
-						int rc = add_new_instr_entry(&inline_xedd, addr, xed_decoded_inst_get_length(&inline_xedd),0,0);//ADD THE INST TO THE GLOBAL MAP
-						if (rc < 0) {
-							cerr << "ERROR: failed during instructon translation." << endl;
-							translated_rtn[rtn_num].instr_map_entry = -1;
-							break;
-						} 
-					}
-				  
-				} else{
-				int rc = add_new_instr_entry(&inline_xedd, addr, xed_decoded_inst_get_length(&inline_xedd),inline_counter,0);//ADD THE INST TO THE GLOBAL MAP
-				if (rc < 0) {
-					cerr << "ERROR: failed during instructon translation." << endl;
-					translated_rtn[rtn_num].instr_map_entry = -1;
-					break;
 				}
-				cerr << " Callee addr: " << std::hex << addr << "\n";
-				}
-			}
-			RTN_Close(rtn);
-	
-			
-		}
-		*/ ///////////////////////////// delete hereeeeeeeeeee
-		//else{ ///////////////////////////// delete hereeeeeeeeeee
-			// Add instr into global instr_map:
-			/*
-			int rc = add_new_instr_entry(&xedd, addr, xed_decoded_inst_get_length(&xedd),0,0);
-			if (rc < 0) {
-				cerr << "ERROR: failed during instructon translation." << endl;
-				translated_rtn[rtn_num].instr_map_entry = -1;
-				break;
-			}
-			*/
-		//}	   ///////////////////////////// delete hereeeeeeeeeee
-      
-       
-     // end for map<...
-	 //bbb
-	 /*
-	 	ADDRINT rtn_addr; 
-	USIZE rtn_size;
-	int instr_map_entry;   // negative instr_map_entry means routine does not have a translation.
-	bool isSafeForReplacedProbe;	
-} translated_rtn_t;
-	 */
-	 
-	 /*
-	 cout << "PRINTING ROUTINE STRUCT:  " << endl;
-	 cout << "translated_rtn_num: " << translated_rtn_num << endl;
-	  cout << "rtn_num: " << rtn_num << endl;
-	 
+				else{
+					rc = add_new_instr_entry(&xedd, curr_orig_ins_addr, xed_decoded_inst_get_length(&xedd),inline_counter,curr_orig_targ_addr);
 
-	 for(int k =0; k<translated_rtn_num;++k){
-		 cout << std::hex <<" rtn_address: " <<  translated_rtn[k].rtn_addr 
-			  << std::dec <<" rtn_size: " <<  translated_rtn[k].rtn_size
-			  << " instr_map_entry: " <<  translated_rtn[k].instr_map_entry
-			  << " isSafeForReplacedProbe: " <<  translated_rtn[k].isSafeForReplacedProbe
-			  << endl;
-		 
-	 }
-	*/
+					if (rc < 0) {
+						cerr << "ERROR: failed during instructon translation." << endl;
+						translated_rtn[translated_rtn_num].instr_map_entry = -1;
+
+						break;
+					}
+				}
+				//cout << "last entry1: " <<  num_of_instr_map_entries << endl;	
+			}
+			//cout << "last entry2: " <<  num_of_instr_map_entries << endl;	
+
+		}	
+	}
+	
+
+
+
     return 0;
 }
 /***************************/
@@ -1712,6 +1635,13 @@ int allocate_and_init_memory(IMG img)
 	// Allocate memory for the instr map needed to fix all branch targets in translated routines:
 	instr_map = (instr_map_t *)calloc(max_ins_count, sizeof(instr_map_t));
 	if (instr_map == NULL) {
+		perror("calloc");
+		return -1;
+	}
+	//tmp_instr_map_t *tmp_instr_map = NULL;
+
+	tmp_instr_map = (tmp_instr_map_t *)calloc(max_ins_count, sizeof(tmp_instr_map_t));
+	if (tmp_instr_map == NULL) {
 		perror("calloc");
 		return -1;
 	}
@@ -2098,8 +2028,8 @@ VOID Fini(INT32 code, VOID* v) {
 		unsigned long curr_call_count=pair.second;
 		if(rtn_map.find(targ_addr)==rtn_map.end()){continue;}
 		if((std::find(hot_rtns_vec.begin(), hot_rtns_vec.end(), targ_addr) != hot_rtns_vec.end()) && (curr_call_count > rtn_map[targ_addr]->calls_num/dominant_threshold)){
-			hot_calls_set.insert(call_address);
-			cout << "HOT CALL: " << std::hex << call_address << endl;
+			hot_calls_vector.push_back(call_address);
+			//cout << "HOT CALL: " << std::hex << call_address << endl;
 		}
     }
 
